@@ -41,7 +41,6 @@ public class TestXmlRecordReader {
         // Sets Root XPath for Record Reader
         conf.set("hive.xml.xpath.root","//book");
         // Sets Col XPaths for Record Reader
-        // TODO Really need to think about this pattern. Does Hive have a better way to handle this?
         conf.set("hive.xml.xpath.column.1","@id");
         conf.set("hive.xml.xpath.column.2","author");
         conf.set("hive.xml.xpath.column.3","title");

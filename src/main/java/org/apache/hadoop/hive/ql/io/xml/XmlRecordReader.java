@@ -1,30 +1,22 @@
 package org.apache.hadoop.hive.ql.io.xml;
 
-import net.sf.saxon.s9api.DocumentBuilder;
-import net.sf.saxon.s9api.Processor;
-import net.sf.saxon.s9api.SaxonApiException;
-import net.sf.saxon.s9api.XPathCompiler;
-import net.sf.saxon.s9api.XPathSelector;
-import net.sf.saxon.s9api.XdmItem;
-import net.sf.saxon.s9api.XdmNode;
-import net.sf.saxon.s9api.XdmValue;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.BytesWritable;
 import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.InputSplit;
 import org.apache.hadoop.mapreduce.RecordReader;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
 import org.apache.hadoop.mapreduce.lib.input.FileSplit;
+import org.apache.hadoop.util.ReflectionUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.xml.transform.stream.StreamSource;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 
@@ -32,103 +24,58 @@ public class XmlRecordReader extends RecordReader<NullWritable, Text> {
 
     private static final Logger LOG = LoggerFactory.getLogger(XmlRecordReader.class);
 
+    private static final String XML_READER_CLASS = "hive.xml.reader.class";
     private static final String XPATH_ROOT = "hive.xml.xpath.root";
-    private static final String XPATH_COLS = "hive.xml.xpath.column.";
-    private static final String ENABLE_DEBUG_PROPS = "hive.xml.debug.props";
+    private static final String XPATH_COLS_PREFIX = "hive.xml.xpath.column.";
     private static final String DELIM_PROP = "hive.xml.field.delim";
     private static final String DEFAULT_DELIM = "\1";
-    private static final String EMPTY_STRING = "";
+
+    private AbstractXmlReader xmlReader;
 
     private FSDataInputStream fileIn;
-    private XdmValue rootNodes;
-    private Map<Integer, XPathSelector> colXPaths;
-    private NullWritable key;
-    private Text value;
+    private final Text value = new Text();
     private String delim;
-    private int size;
-    private int current;
 
     @Override
     public void initialize(InputSplit genericSplit, TaskAttemptContext context) throws IOException {
-        FileSplit split = (FileSplit) genericSplit;
-        Path file = split.getPath();
-        Configuration job = context.getConfiguration();
-        FileSystem fs = file.getFileSystem(job);
+        final FileSplit split = (FileSplit) genericSplit;
+        final Path file = split.getPath();
+        final Configuration job = context.getConfiguration();
+        final FileSystem fs = file.getFileSystem(job);
+        if (xmlReader == null) {
+            xmlReader = (AbstractXmlReader) ReflectionUtils.newInstance(job.getClass(XML_READER_CLASS, SaxonXmlReader.class), job);
+        }
+        final String rootXPath = job.get(XPATH_ROOT);
+        final List<String> colXPaths = extractColXPathExpressions(job);
 
-        key = NullWritable.get();
-        value = new Text();
         delim = job.get(DELIM_PROP, DEFAULT_DELIM);
-
-        // If Debug Properties Enabled - Dump All hive.xml properties.
-        if (job.getBoolean(ENABLE_DEBUG_PROPS, false)) {
-            Map<String, String> props = job.getValByRegex("hive\\.xml\\.");
-            // Doing this awfulness to sort the output.
-            // Since this is only run if debug is on it shouldn't be an issue.
-            props = new TreeMap<>(props);
-            props.forEach((key, value) -> LOG.info(key + " : " + value));
-        }
-
-        final String rootXPathExpression = job.get(XPATH_ROOT);
-        final Map<String, String> colXPathExpressions = job.getPropsWithPrefix(XPATH_COLS);
-
         fileIn = fs.open(file);
-        Processor processor = new Processor(false);
-        DocumentBuilder builder = processor.newDocumentBuilder();
-        try {
-            XdmNode rootNode = builder.build(new StreamSource(fileIn));
-            XPathCompiler xPath = processor.newXPathCompiler();
-            XPathSelector rootXPath = xPath.compile(rootXPathExpression).load();
-            rootXPath.setContextItem(rootNode);
-            rootNodes = rootXPath.evaluate();
-
-            // Compile and Aa Column XPath Selectors to Collection in Order
-            colXPaths = new TreeMap<>();
-            for (Map.Entry<String, String> e : colXPathExpressions.entrySet()) {
-                colXPaths.put(Integer.valueOf(e.getKey()), xPath.compile(e.getValue()).load());
-            }
-        } catch (SaxonApiException ex) {
-            throw new IOException(ex);
-        }
-
-        current = 0;
-        size = rootNodes.size();
 
         // TODO Implement Compression
+
+        xmlReader.initialize(fileIn, AbstractXmlReader.EMPTY_NAMESPACE_LIST, rootXPath, colXPaths);
     }
 
     @Override
     public boolean nextKeyValue() throws IOException {
-        if (current == size) {
-            return false;
-        } else {
-            XdmItem node = rootNodes.itemAt(current);
+        if (xmlReader.next()) {
             StringBuilder columnStringBuilder = new StringBuilder();
-            for (Map.Entry<Integer, XPathSelector> e : colXPaths.entrySet()) {
-                if (e.getKey() > 1) {
+            for (int i = 0; i < xmlReader.size(); i++) {
+                if (i > 0) {
                     columnStringBuilder.append(delim);
                 }
-                XPathSelector colXPath = e.getValue();
-                try {
-                    colXPath.setContextItem(node);
-                    XdmItem colValue = colXPath.evaluateSingle();
-                    if (colValue != null) {
-                        columnStringBuilder.append(colValue.getStringValue());
-                    } else {
-                        columnStringBuilder.append(EMPTY_STRING.getBytes());
-                    }
-                } catch (SaxonApiException ex) {
-                    throw new IOException(ex);
-                }
+                columnStringBuilder.append(xmlReader.getString(i));
             }
             value.set(columnStringBuilder.toString());
-            current++;
             return true;
+        } else {
+            return false;
         }
     }
 
     @Override
     public NullWritable getCurrentKey() {
-        return this.key;
+        return NullWritable.get();
     }
 
     @Override
@@ -146,5 +93,19 @@ public class XmlRecordReader extends RecordReader<NullWritable, Text> {
         if (fileIn != null) {
             fileIn.close();
         }
+    }
+
+    // Helper method to workaround the lack of getPropsWithPrefix method in Hadoop 2.8+
+    // Once all major vendors have upgraded to Hadoop 3.0 this can be replaced
+    private List<String> extractColXPathExpressions(Configuration conf) {
+        Map<Integer, String> colXPathMap = new TreeMap<>();
+        for (Map.Entry<String, String> entry : conf) {
+            if (entry.getKey().startsWith(XmlRecordReader.XPATH_COLS_PREFIX)) {
+                String key = entry.getKey().substring(XmlRecordReader.XPATH_COLS_PREFIX.length());
+                String value = entry.getValue();
+                colXPathMap.put(Integer.valueOf(key), value);
+            }
+        }
+        return new ArrayList<>(colXPathMap.values());
     }
 }
